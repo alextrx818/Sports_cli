@@ -138,7 +138,9 @@ start_fetcher() {
     
     # Activate virtual environment and start the script
     print_status "Starting Python script with activated virtual environment..."
-    source "$VENV_DIR/bin/activate" && nohup "$PYTHON_BIN" "$PYTHON_SCRIPT" --continuous >> "$LOG_FILE" 2>&1 &
+    # Activate venv in this shell, then launch python in background
+    source "$VENV_DIR/bin/activate"
+    nohup "$PYTHON_BIN" "$PYTHON_SCRIPT" >> "$LOG_FILE" 2>&1 &
     PID=$!
     
     # Save PID to file

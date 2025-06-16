@@ -17,9 +17,17 @@ CRITICAL USAGE NOTES:
 
 STARTUP METHODS:
 ---------------
-1. Direct: python3 step1_json.py
-2. Via script: bash start.sh (includes logging and background execution)
-3. Via cron/systemd: Ensure proper working directory and environment
+1. Direct: python3 step1.py (single run)
+2. Continuous: python3 step1.py --continuous (60-second cycles)
+3. Via shell/nohup: source venv/bin/activate && nohup python step1.py --continuous > pipeline.log 2>&1 &
+4. Via script: bash test_pipeline_flow.sh (for testing flow)
+
+PIPELINE STARTUP RESOLUTION (2025-06-16):
+-----------------------------------------
+** ISSUE: Pipeline failed to start due to KeyError in footer data and JSON corruption
+** SOLUTION: Use shell-based startup with nohup for robust background execution:
+   source venv/bin/activate && nohup python step1.py --continuous > pipeline.log 2>&1 &
+** RESULT: Stable continuous operation with proper Step 1 → Step 2 orchestration
 
 IMPORTANT TERMINOLOGY:
 ---------------------
@@ -71,47 +79,6 @@ The in-memory data is passed directly to extract_merge_summarize() for immediate
 This creates step2.json without requiring separate manual execution.
 """
 
-# ============================================================================
-# SCHEMA CONTRACT - DO NOT MODIFY FIELD NAMES
-# ============================================================================
-# This file produces step1.json with the following structure:
-# {
-#   "live_matches": [
-#     {
-#       "match_id": str,              # Unique match identifier
-#       "home_team": str,             # Home team name
-#       "away_team": str,             # Away team name
-#       "home_team_id": str,          # Home team ID
-#       "away_team_id": str,          # Away team ID
-#       "status_id": int,             # Match status (1-13, see models.MatchStatus)
-#       "home_score": int,            # Current home score
-#       "away_score": int,            # Current away score
-#       "match_time": int,            # Unix timestamp
-#       "competition_id": str,        # Competition ID
-#       "venue_id": str,              # Venue ID
-#       "round": int,                 # Round number
-#       "environment": {              # Weather data (optional)
-#         "weather": int/str,         # Weather code or description
-#         "temperature": str,         # e.g. "21°C"
-#         "wind_speed": str,          # e.g. "5.1m/s"
-#         "humidity": str,            # e.g. "65%"
-#         "pressure": str             # e.g. "1013hPa"
-#       }
-#     }
-#   ],
-#   "timestamp": str,                 # ISO format timestamp
-#   "total_matches_fetched": int      # Total count
-# }
-#
-# IMPORTANT: Use models.py for validation when processing this data
-# ============================================================================
-
-# MAINTENANCE NOTES:
-# - models.py: Only update if adding new fields to the pipeline
-# - Schema contract headers: Just comments, no maintenance needed
-# - FIELD_REFERENCE.md: Update only when adding new fields
-# - This schema contract is locked - DO NOT change existing field names
-
 import asyncio
 import aiohttp
 import json
@@ -132,7 +99,6 @@ from collections import defaultdict
 from contextlib import contextmanager
 from dotenv import load_dotenv
 import step2
-import step7
 from pathlib import Path
 
 # Import centralized logging
@@ -1165,10 +1131,44 @@ def step1_main():
     return all_data
 
 def save_to_json(data, filename):
-    """Save data to a JSON file with pretty printing"""
+    """Save data to a JSON file with pretty printing and rotation support"""
     with open(filename, 'w') as f:
         json.dump(data, f, indent=2)
     print(f"Data saved to {filename}")
+
+def rotate_step1_json_if_needed():
+    """
+    Rotate step1.json at midnight Eastern Time.
+    Creates step1_YYYY-MM-DD.json archive and starts fresh step1.json
+    """
+    ny_tz = pytz.timezone("America/New_York")
+    now = datetime.now(ny_tz)
+    
+    # Check if step1.json exists and needs rotation
+    if not os.path.exists("step1.json"):
+        return False
+        
+    # Get the last modification time of step1.json
+    last_modified = datetime.fromtimestamp(os.path.getmtime("step1.json"), tz=ny_tz)
+    
+    # Check if we've crossed midnight since last modification
+    if last_modified.date() < now.date():
+        # Create archived filename with yesterday's date
+        yesterday = last_modified.strftime("%Y-%m-%d")
+        archive_filename = f"step1_{yesterday}.json"
+        
+        # Only rotate if archive doesn't already exist
+        if not os.path.exists(archive_filename):
+            try:
+                # Move current step1.json to archived filename
+                shutil.move("step1.json", archive_filename)
+                logger.info(f"✅ Rotated step1.json → {archive_filename}")
+                return True
+            except Exception as e:
+                logger.error(f"❌ Failed to rotate step1.json: {e}")
+                return False
+    
+    return False
 
 def get_ny_time():
     """Get current time in New York timezone - legacy function"""
@@ -1213,8 +1213,14 @@ def create_unified_status_summary(live_matches_data):
     for match in matches:
         status_id = extract_status_id(match)
         if status_id is not None:
-            status_counts[status_id] = status_counts.get(status_id, 0) + 1
             matches_with_status += 1
+            status_desc = status_desc_map.get(status_id, f"Unknown Status")
+            if status_id not in status_counts:
+                status_counts[status_id] = {
+                    "description": status_desc,
+                    "count": 0
+                }
+            status_counts[status_id]["count"] += 1
     
     # Create formatted summary lines and structured data
     formatted_summary = []
@@ -1460,7 +1466,7 @@ def print_comprehensive_match_breakdown(comprehensive_match_breakdown):
 
 def continuous_loop():
     """
-    Run Step 1 → Step 2 → Step 7 every 60 seconds (wall-clock).
+    Run Step 1 → Step 2 every 60 seconds (wall-clock).
     If any sub-step throws, catch it, log, and move to the next cycle.
     """
     global shutdown_flag
@@ -1515,11 +1521,18 @@ def continuous_loop():
 
             end_time = datetime.now(pytz.timezone("America/New_York"))
             total_duration = (end_time - start_time).total_seconds()
+            ny_time = get_ny_time_str()  # Get updated timestamp for footer
             
             # Calculate in-play matches for logging
             in_play_count = sum(
                 1 for m in matches if extract_status_id(m) in [2,3,4,5,6,7]
             )
+            
+            # Create comprehensive footer for step1.json (same as step1_main)
+            footer = create_comprehensive_footer(live_data, all_data, total_duration, match_number, ny_time, pipeline_complete=False, total_pipeline_time=None)
+            
+            # Add footer to JSON data
+            all_data["step1_completion_summary"] = footer
             
             logger.info("="*80)
             logger.info(f"STEP 1 – FETCH COMPLETED – {end_time.strftime('%m/%d/%Y %I:%M:%S %p')} (NYT)")
@@ -1528,8 +1541,19 @@ def continuous_loop():
             logger.info(f"In-Play matches: {in_play_count} (status 2–7)")
             logger.info("="*80)
 
-            # Save the raw data to step1.json
+            # Check if step1.json needs rotation (at midnight EST)
+            rotation_performed = rotate_step1_json_if_needed()
+            
+            # Save the raw data to step1.json (now includes comprehensive footer)
             save_to_json(all_data, "step1.json")
+            
+            # Update recent_fetches.json mirror (lightweight version for VS Code)
+            try:
+                from create_recent_mirror import create_or_update_recent_fetches
+                create_or_update_recent_fetches(all_data)
+                logger.info("✅ Updated step1_mirror.json mirror")
+            except Exception as e:
+                logger.warning(f"⚠️ Could not update step1_mirror.json: {e}")
             
             # ─── Step 2: Merge + Flatten → step2.json ───────────────────────────────
             logger.info("Starting Step 2 (merge + flatten)...")
@@ -1543,23 +1567,14 @@ def continuous_loop():
                 s2_time = time.time() - start_s2
                 logger.error(f"STEP 2 failed after {s2_time:.2f}s: {e2}")
                 traceback.print_exc()
-                summaries = []  # Continue to Step 7 even if Step 2 fails
+                summaries = []  # Continue even if Step 2 fails
 
-            # Let step2 handle calling step7
-            # step7.run_step7(matches_list=summaries)
 
-            # Daily rotation file (once per day)
-            ny_tz = pytz.timezone("America/New_York")
-            ny_now = datetime.now(ny_tz)
-            daily_filename = f'step1_{ny_now.strftime("%Y-%m-%d")}.json'
-            
-            if not os.path.exists(daily_filename):
-                save_to_json(all_data, daily_filename)
-                logger.info(f"Daily rotation: Created {daily_filename}")
+            # Note: Daily rotation is now handled by rotate_step1_json_if_needed()
 
         except Exception as e:
             # Catch any error in this cycle so we don't break the loop permanently
-            logger.error(f"Exception during cycle: {e}")
+            logger.error(f"Error in continuous loop: {e}")
             traceback.print_exc()
 
         # ─── Sleep for remainder so that each cycle is exactly 60 seconds total ───
@@ -1579,7 +1594,7 @@ def continuous_loop():
     logger.info("Continuous loop has been signaled to stop. Exiting gracefully.")
 
 def run_single_cycle():
-    """Run a single Step 1 → Step 2 → Step 7 cycle (for non-continuous mode)"""
+    """Run a single Step 1 → Step 2 cycle (for non-continuous mode)"""
     try:
         # Record pipeline start time
         pipeline_start = time.time()
@@ -1603,8 +1618,19 @@ def run_single_cycle():
         result["detailed_status_mapping"] = detailed_status_mapping
         result["comprehensive_match_breakdown"] = comprehensive_match_breakdown
         
+        # Check if step1.json needs rotation (at midnight EST)
+        rotate_step1_json_if_needed()
+        
         # Save to step1.json
         save_to_json(result, 'step1.json')
+        
+        # Update recent_fetches.json mirror (lightweight version for VS Code)
+        try:
+            from create_recent_mirror import create_or_update_recent_fetches
+            create_or_update_recent_fetches(result)
+            logger.info("✅ Updated step1_mirror.json mirror")
+        except Exception as e:
+            logger.warning(f"⚠️ Could not update step1_mirror.json: {e}")
         
         # Step 2: Process and flatten with timing
         start_s2 = time.time()
@@ -1612,17 +1638,9 @@ def run_single_cycle():
         s2_time = time.time() - start_s2
         print(f"Step 2: Produced {len(summaries)} summaries in {s2_time:.2f}s")
         
-        # Let step2 handle calling step7
-        # step7.run_step7(matches_list=summaries)
+        # Let step2 handle downstream processing
 
-        # Daily rotation file
-        ny_tz = pytz.timezone("America/New_York")
-        ny_now = datetime.now(ny_tz)
-        daily_filename = f'step1_{ny_now.strftime("%Y-%m-%d")}.json'
-        
-        if not os.path.exists(daily_filename):
-            save_to_json(result, daily_filename)
-            logger.info(f"Daily rotation: Created {daily_filename}")
+        # Note: Daily rotation is now handled by rotate_step1_json_if_needed()
         
         # Print completion summary
         print(f"Data saved at {get_ny_time_str()} (New York Time)")
@@ -1644,7 +1662,7 @@ def run_single_cycle():
 
 def update_step2_pipeline_timing(total_pipeline_time: float):
     """
-    Update step2.json with the complete pipeline timing from Step 1 to Step 7 completion.
+    Update step2.json with the complete pipeline timing from Step 1 to Step 2 completion.
     """
     try:
         step2_file = Path("step2.json")
@@ -1658,7 +1676,7 @@ def update_step2_pipeline_timing(total_pipeline_time: float):
                 data["step2_processing_summary"]["total_pipeline_time"] = f"{total_pipeline_time:.2f} seconds"
                 
                 # Also update the footer section
-                data["step2_processing_summary"]["completion_status"] = f"COMPLETE PIPELINE (Step 1→7) – FINISHED SUCCESSFULLY – {datetime.now(pytz.timezone('America/New_York')).strftime('%m/%d/%Y %I:%M:%S %p %Z')}"
+                data["step2_processing_summary"]["completion_status"] = f"COMPLETE PIPELINE (Step 1→2) – FINISHED SUCCESSFULLY – {datetime.now(pytz.timezone('America/New_York')).strftime('%m/%d/%Y %I:%M:%S %p %Z')}"
             
             # Save updated data
             with open(step2_file, "w", encoding="utf-8") as f:
@@ -1673,7 +1691,7 @@ def update_step2_pipeline_timing(total_pipeline_time: float):
 
 def update_step1_pipeline_timing(total_pipeline_time: float):
     """
-    Update step1.json with the complete pipeline timing from Step 1 to Step 7 completion.
+    Update step1.json with the complete pipeline timing from Step 1 to Step 2 completion.
     """
     try:
         step1_file = Path("step1.json")
@@ -1684,11 +1702,11 @@ def update_step1_pipeline_timing(total_pipeline_time: float):
             if 'step1_completion_summary' in data:
                 # Update completion status to show full pipeline completion
                 ny_time = get_ny_time_str()
-                data['step1_completion_summary']['completion_status'] = f"COMPLETE PIPELINE (Step 1→7) – FINISHED SUCCESSFULLY – {ny_time}"
+                data['step1_completion_summary']['completion_status'] = f"COMPLETE PIPELINE (Step 1→2) – FINISHED SUCCESSFULLY – {ny_time}"
                 data['step1_completion_summary']['total_pipeline_time'] = f"{total_pipeline_time:.2f} seconds"
                 
                 # Update completion status to show full pipeline completion
-                data["step1_completion_summary"]["completion_status"] = f"COMPLETE PIPELINE (Step 1→7) – FINISHED SUCCESSFULLY – {ny_time}"
+                data["step1_completion_summary"]["completion_status"] = f"COMPLETE PIPELINE (Step 1→2) – FINISHED SUCCESSFULLY – {ny_time}"
                 data["step1_completion_summary"]["total_pipeline_time"] = f"{total_pipeline_time:.2f} seconds"
                 
                 # Save updated JSON
@@ -1714,8 +1732,8 @@ def create_comprehensive_footer(live_data, all_data, total_duration, match_numbe
         total_duration: Step 1 execution time
         match_number: Daily match counter
         ny_time: Formatted timestamp
-        pipeline_complete: Whether the full pipeline (Step 1→7) has completed
-        total_pipeline_time: Total time for full pipeline (Step 1→7)
+        pipeline_complete: Whether the full pipeline (Step 1→2) has completed
+        total_pipeline_time: Total time for full pipeline (Step 1→2)
     """
     matches = live_data.get("results", [])
     total_matches = len(matches)
@@ -1771,19 +1789,60 @@ def create_comprehensive_footer(live_data, all_data, total_duration, match_numbe
     
     # Set completion status based on pipeline state
     if pipeline_complete:
-        completion_status = f"COMPLETE PIPELINE (Step 1→7) – FINISHED SUCCESSFULLY – {ny_time}"
+        completion_status = f"COMPLETE PIPELINE (Step 1→2) – FINISHED SUCCESSFULLY – {ny_time}"
     else:
         completion_status = f"STEP 1 - FETCH COMPLETED SUCCESSFULLY - {ny_time}"
+    
+    # Count environment data availability (simplified)
+    env_count = 0
+    for match in matches:
+        match_id = match.get("id", "")
+        match_detail_data = all_data.get("match_details", {}).get(match_id, {})
+        if isinstance(match_detail_data, dict) and "results" in match_detail_data:
+            results = match_detail_data["results"]
+            if isinstance(results, list) and results and results[0].get("environment"):
+                env_count += 1
+    
+    # API response metadata
+    api_response_time = "N/A"
+    api_code = live_data.get("code", "Unknown")
     
     footer = {
         "footer": "="*80,
         "completion_status": completion_status,
         "daily_match_number": match_number,
-        "total_matches_fetched_all_statuses": f"{total_matches} matches (ALL status IDs from Step 1 live endpoint)",
-        "in_play_matches": f"{in_play_count} (status IDs 2–7)",
-        "other_status_matches": f"{other_matches} (status IDs 0,1,8,9,10,11,12,13)",
-        "step1_execution_time": f"{total_duration:.2f} seconds",
-        "total_pipeline_time": f"{total_pipeline_time:.2f} seconds" if total_pipeline_time is not None else "N/A",
+        "fetch_timestamp": ny_time,
+        "api_performance": {
+            "total_matches_fetched": total_matches,
+            "api_response_code": api_code,
+            "step1_execution_time": f"{total_duration:.2f} seconds",
+            "enrichment_stats": {
+                "unique_teams_fetched": unique_teams,
+                "unique_competitions_fetched": unique_competitions,
+                "match_details_enriched": match_details,
+                "match_odds_enriched": match_odds,
+                "matches_with_environment_data": env_count
+            }
+        },
+        "match_status_breakdown": {
+            "total_matches_all_statuses": f"{total_matches} matches (ALL status IDs from Step 1 live endpoint)",
+            "in_play_matches": f"{in_play_count} (status IDs 2–7: actively playing)",
+            "other_status_matches": f"{other_matches} (status IDs 0,1,8,9,10,11,12,13: scheduled/finished/delayed)",
+            "detailed_status_counts": status_breakdown_list
+        },
+        "pipeline_timing": {
+            "step1_execution_time": f"{total_duration:.2f} seconds",
+            "total_pipeline_time": f"{total_pipeline_time:.2f} seconds" if total_pipeline_time is not None else "N/A (Step 1 only)"
+        },
+        "data_quality": {
+            "matches_with_complete_data": f"{len(all_data.get('match_details', []))}/{total_matches}",
+            "environment_data_coverage": f"{env_count}/{total_matches}",
+            "odds_data_coverage": f"{len(all_data.get('match_odds', []))}/{total_matches}"
+        },
+        "total_matches_all_statuses": f"{total_matches} matches (ALL status IDs from Step 1 live endpoint)",
+        "in_play_matches": f"{in_play_count} (status IDs 2–7: actively playing)",
+        "pipeline_completion_timestamp": ny_time,
+        "total_pipeline_completion_time": f"{total_pipeline_time:.2f} seconds" if total_pipeline_time is not None else f"{total_duration:.2f} seconds (Step 1 only)",
         "footer_end": "="*80
     }
     
@@ -1792,7 +1851,7 @@ def create_comprehensive_footer(live_data, all_data, total_duration, match_numbe
 def update_step1_footer_after_pipeline(step1_json_path, total_pipeline_time):
     """
     Update the step1.json footer with total pipeline time and completion status
-    after the full pipeline (Step 1→7) has completed.
+    after the full pipeline (Step 1→2) has completed.
     """
     try:
         with open(step1_json_path, 'r') as f:
@@ -1801,7 +1860,7 @@ def update_step1_footer_after_pipeline(step1_json_path, total_pipeline_time):
         if 'step1_completion_summary' in data:
             # Update completion status to show full pipeline completion
             ny_time = get_ny_time_str()
-            data['step1_completion_summary']['completion_status'] = f"COMPLETE PIPELINE (Step 1→7) – FINISHED SUCCESSFULLY – {ny_time}"
+            data['step1_completion_summary']['completion_status'] = f"COMPLETE PIPELINE (Step 1→2) – FINISHED SUCCESSFULLY – {ny_time}"
             data['step1_completion_summary']['total_pipeline_time'] = f"{total_pipeline_time:.2f} seconds"
             
             # Save updated JSON

@@ -101,10 +101,12 @@ Step 2 automatically converts environment data to user-friendly formats:
 
 import json
 import logging
+import os
 from datetime import datetime
 import pytz
 import time
 from pathlib import Path
+import step7
 
 # Constants
 STEP1_JSON = "/root/6-4-2025/step1.json"
@@ -576,6 +578,72 @@ def save_match_summaries(data: dict, output_file: str) -> bool:
         logger.error(f"Failed to save to {output_file}: {e}")
         return False
 
+def update_step2_mirror(current_data: dict) -> bool:
+    """
+    Update step2_mirror.json with rolling last 5 fetches.
+    Maintains exact mirror structure but limits to last 5 fetches.
+    
+    Args:
+        current_data: Current step2 data to add to mirror
+        
+    Returns:
+        bool: True if successful, False otherwise
+    """
+    mirror_file = "/root/6-4-2025/step2_mirror.json"
+    
+    try:
+        # Read existing mirror data
+        history = []
+        if os.path.exists(mirror_file):
+            try:
+                with open(mirror_file, 'r', encoding='utf-8') as f:
+                    existing_data = json.load(f)
+                    history = existing_data.get("history", [])
+            except (json.JSONDecodeError, FileNotFoundError):
+                # Start fresh if file is corrupted
+                history = []
+        
+        # Add current fetch to history
+        fetch_entry = {
+            "fetch_time": datetime.now(TZ).strftime("%m/%d/%Y %I:%M:%S %p %Z"),
+            "fetch_timestamp": datetime.now(TZ).isoformat(),
+            "summaries": current_data.get("summaries", []),
+            "metadata": current_data.get("metadata", {}),
+            "step2_processing_summary": current_data.get("step2_processing_summary", {}),
+            "total_matches": len(current_data.get("summaries", []))
+        }
+        
+        # Add to history and keep only last 5
+        history.append(fetch_entry)
+        history = history[-5:]  # Keep only last 5 fetches
+        
+        # Create mirror structure
+        mirror_data = {
+            "mirror_info": {
+                "created_at": datetime.now(TZ).strftime("%m/%d/%Y %I:%M:%S %p %Z"),
+                "purpose": "Rolling mirror of last 5 step2.json fetches",
+                "total_fetches_stored": len(history),
+                "latest_fetch": history[-1]["fetch_time"] if history else "None",
+                "note": "Exact mirror of step2.json data, limited to last 5 fetches"
+            },
+            "current_fetch": fetch_entry,  # Most recent fetch at top level
+            "history": history,  # All 5 fetches in chronological order
+            "summaries": current_data.get("summaries", []),  # Current summaries for compatibility
+            "metadata": current_data.get("metadata", {}),
+            "step2_processing_summary": current_data.get("step2_processing_summary", {})
+        }
+        
+        # Save mirror
+        with open(mirror_file, 'w', encoding='utf-8') as f:
+            json.dump(mirror_data, f, indent=2, ensure_ascii=False)
+        
+        logger.info(f"Mirror updated: {len(history)} fetches stored, latest: {fetch_entry['total_matches']} matches")
+        return True
+        
+    except Exception as e:
+        logger.error(f"Failed to update step2_mirror.json: {e}")
+        return False
+
 def main():
     """Main entry point"""
     logger.info("Step 2 processing started...")
@@ -653,20 +721,20 @@ def main():
         if success:
             logger.info(f"Step 2 completed successfully in {processing_time} seconds")
             logger.info(f"Created {len(merged_data['summaries'])} match summaries")
+            
+            # Create rolling mirror with last 5 fetches
+            try:
+                logger.info("🔍 DEBUG: About to call update_step2_mirror()")
+                update_step2_mirror(merged_data)
+                logger.info("✅ Updated step2_mirror.json with last 5 fetches")
+            except Exception as e:
+                logger.warning(f"⚠️ Could not update step2_mirror.json: {e}")
+                import traceback
+                logger.error(f"Mirror update traceback: {traceback.format_exc()}")
         else:
             logger.error("Step 2 failed to save output")
             
-        # Call Step 7 after Step 2 completes
-        try:
-            import step7
-            import importlib
-            importlib.reload(step7)  # Force reload to pick up any code changes
-            logger.info("Starting Step 7 (filter & pretty-print)...")
-            step7.run_step7(matches_list=merged_data['summaries'])
-        except (ImportError, AttributeError) as e:
-            logger.error(f"Failed to run Step 7: {e}")
-            import traceback
-            traceback.print_exc()
+        # Step 2 processing complete
             
     except FileNotFoundError:
         logger.error(f"Could not find {STEP1_JSON}. Please run step1.py first.")
@@ -762,18 +830,26 @@ def run_step2(pipeline_start_time=None):
         logger.info(f"Saving {len(summaries)} match summaries to {STEP2_JSON}...")
         success = save_match_summaries(merged_data, STEP2_JSON)
         
+        # Always update mirror after saving step2.json
+        try:
+            update_step2_mirror(merged_data)
+            logger.info("✅ Updated step2_mirror.json with last 5 fetches")
+        except Exception as e:
+            logger.warning(f"⚠️ Could not update step2_mirror.json: {e}")
+        
         if success:
             logger.info(f"Step 2 completed successfully in {processing_time} seconds")
             logger.info(f"Created {len(summaries)} match summaries")
-            # Call Step 7 after Step 2 completes
+            
+            # Call Step 7 to continue the pipeline
             try:
-                import step7
-                import importlib
-                importlib.reload(step7)  # Force reload to pick up any code changes
-                logger.info("Starting Step 7 (filter & pretty-print)...")
-                step7.run_step7(matches_list=summaries)
-            except (ImportError, AttributeError) as e:
-                logger.error(f"Failed to run Step 7 due to import or attribute error: {e}")
+                logger.info("Starting Step 7 (match filtering)...")
+                step7.run_step7(summaries)
+                logger.info("Step 7 completed successfully")
+            except Exception as e:
+                logger.error(f"Step 7 failed: {e}")
+            
+            # Step 2 processing complete for run_step2 function
             return summaries
         else:
             logger.error("Step 2 failed to save output")

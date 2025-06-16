@@ -1,0 +1,7 @@
+{
+    "files.maxMemoryForLargeFilesMB": 100,
+    "files.exclude": {
+        "step1.json": true,
+        "step1_*.json": true
+    }
+}
